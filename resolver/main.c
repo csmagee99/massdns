@@ -117,6 +117,10 @@ void resolver_handle_response(context_t *context, socket_info_t *socket, sockadd
         if (value)
         {
             agenda_value_update_time(value, 0);
+            if(ldns_pkt_get_rcode(packet) != LDNS_RCODE_NOERROR)
+            {
+                value->reply_packet = ldns_pkt_clone(packet);
+            }
         }
 
         cache_put_packet(context->cache, packet);
