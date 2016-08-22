@@ -1,6 +1,5 @@
 .idea/
 bin/
-/CMakeLists.txt
 *.bin
 vgcore.*
 core
