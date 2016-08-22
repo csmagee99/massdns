@@ -24,12 +24,6 @@ typedef struct sockaddr_in6 sockaddr_in6_t;
 
 typedef struct
 {
-    void *component1;
-    void *component2;
-} tuple_t;
-
-typedef struct
-{
     char *owner;
     ldns_rr_type type;
     sockaddr_storage_t address;
@@ -121,84 +115,6 @@ char *dname_join(char **source, size_t count)
     return result;
 }
 
-/**
- * Create a dependency chain which has to be resolved from the front.
- *
- * e.g. A query for "example.org." will result in "example.org." -> "org." -> "."
- *
- * @return A list with string elements. The list and its elements should be freed.
- */
-double_list_t *dependency_chain_new(char *owner)
-{
-    double_list_t *list = safe_calloc(sizeof(*list));
-
-    buffer_t labels = dname_split(owner);
-    for (size_t i = 0; i < labels.len; i++)
-    {
-        char *subname = dname_join((char **) labels.data + i, labels.len - i);
-        double_list_push_back(list, subname);
-    }
-    char *root_label = malloc(sizeof(MASSDNS_ROOT_LABEL));
-    strcpy(root_label, MASSDNS_ROOT_LABEL);
-    double_list_push_back(list, root_label);
-    return list;
-}
-
-/**
- * Minimize a dependency chain by considering the first cached entry only.
- *
- * @param list The full, unminimized dependency chain.
- * @param cache The cache.
- */
-void dependency_chain_minimize(double_list_t *list, cache_t cache)
-{
-    double_list_element_t *current;
-    size_t new_list_count = 0;
-    double_list_element_t *new_last = NULL;
-    for (current = list->first; current != NULL; current = current->next)
-    {
-        new_list_count++;
-        if (cache_get_from_data(cache, (char *) current->data, LDNS_RR_TYPE_NS))
-        {
-            new_last = current;
-            current = current->next;
-            break;
-        }
-    }
-    list->count = new_list_count;
-    list->last = new_last;
-
-    // Free the rest of the list
-    while (current != NULL)
-    {
-        double_list_element_t *next = current->next;
-        free(current->data);
-        free(current);
-        current = next;
-    }
-}
-
-char *dependency_chain_next_nameserver(double_list_t *list)
-{
-    return list->last->data;
-}
-
-char *dependency_chain_query(double_list_t *list)
-{
-    return list->first->data;
-}
-
-void dependency_chain_free(double_list_t *list)
-{
-    for (double_list_element_t *elm = list->first; elm != NULL;)
-    {
-        double_list_element_t *next_element = elm->next;
-        free(elm->data);
-        free(elm);
-        elm = next_element;
-    }
-}
-
 bool sockaddr_storage_from_record(ldns_rr *record, sockaddr_storage_t *addr)
 {
     if (ldns_rr_get_type(record) == LDNS_RR_TYPE_A)
@@ -244,7 +160,7 @@ void agenda_value_set_next_nameservers(agenda_t agenda, cache_t cache, agenda_ke
         }
         safe_free(&subname);
     }
-    free(((char **) labels.data)[0]);
+    safe_free(&((char **) labels.data)[0]);
     safe_free(&labels.data);
 
     if (subname == NULL)
@@ -254,9 +170,7 @@ void agenda_value_set_next_nameservers(agenda_t agenda, cache_t cache, agenda_ke
         cached_ns = cache_get_from_data(cache, subname, LDNS_RR_TYPE_NS);
     }
     safe_free(&subname);
-
     ns_list_safe_free(&value->nameservers);
-    value->nameservers = NULL;
 
     value->nameservers = single_list_new();
 
@@ -300,36 +214,33 @@ agenda_ns_t *agenda_value_get_next_nameserver(agenda_value_t *value)
     return value->nameservers->first->data;
 }
 
-resolve_todo_t agenda_todo(agenda_t agenda, cache_t cache, agenda_key_t *key, agenda_value_t *value,
-                           single_list_t *agenda_addition, massdns_ip_support_t ip_support)
+bool agenda_todo(agenda_t agenda, cache_t cache, agenda_key_t *key, agenda_value_t *value,
+                           single_list_t *agenda_addition, massdns_ip_support_t ip_support, resolve_todo_t *todo)
 {
-    resolve_todo_t resolve_todo;
-    resolve_todo.owner = key->owner;
-    resolve_todo.type = key->type;
+    todo->owner = key->owner;
+    todo->type = key->type;
     agenda_ns_t *nameserver = agenda_value_get_next_nameserver(value);
 
     if (nameserver->addresses == NULL || single_list_count(nameserver->addresses) == 0) // NS has to be resolved first
     {
         fprintf(stderr, "Requirement: %s\n", nameserver->owner);
-        agenda_key_t *new_key = safe_malloc(sizeof(*new_key));
-        new_key->owner = nameserver->owner;
-        new_key->type = LDNS_RR_TYPE_A;
+        agenda_key_t *new_key = agenda_key_new(nameserver->owner, LDNS_RR_TYPE_A);
         agenda_value_t *existing_value = agenda_get(agenda, new_key);
         if(!existing_value)
         {
             agenda_value_t *new_value = safe_calloc(sizeof(*new_value));
+            new_value->key = new_key;
             new_value->requirement_for = single_list_new();
             single_list_push_back(new_value->requirement_for, value);
-            agenda_value_update_time(new_value, 0);
-            tuple_t *tuple = tuple_new(new_key, new_value);
-            single_list_push_back(agenda_addition, tuple);
+            agenda_value_update_time(agenda, new_value, 0);
+            single_list_push_back(agenda_addition, new_value);
 
             value->unmet_requirement = true;
             agenda_value_set_next_nameservers(agenda, cache, new_key, new_value, ip_support);
         }
         else
         {
-            safe_free(&new_key);
+            agenda_key_safe_free(&new_key);
             if(!existing_value->requirement_for)
             {
                 existing_value->requirement_for = single_list_new();
@@ -337,12 +248,13 @@ resolve_todo_t agenda_todo(agenda_t agenda, cache_t cache, agenda_key_t *key, ag
             single_list_push_back(existing_value->requirement_for, value);
             value->unmet_requirement = true;
         }
+        return false;
     }
     else
     {
-        resolve_todo.address = *((sockaddr_storage_t *) nameserver->addresses->first->data);
+        todo->address = *((sockaddr_storage_t *) nameserver->addresses->first->data);
+        return true;
     }
-    return resolve_todo;
 }
 
 ldns_pkt *query_from_todo(resolve_todo_t *todo)

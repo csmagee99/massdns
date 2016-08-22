@@ -68,8 +68,8 @@ void cache_put(cache_t cache, cache_key_t *key, cache_value_t *value)
     char *data = ldns_rdf2str(rdf);
     char *type = ldns_rr_type2str(key->type);
     fprintf(stderr, "[Cache] Set: %s %s = %s\n", type, key->owner, data);
-    free(type);
-    free(data);
+    safe_free(&type);
+    safe_free(&data);
 #endif
     hashmapPut(cache, key, value);
 }

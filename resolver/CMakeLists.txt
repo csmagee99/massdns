@@ -14,7 +14,7 @@ set(SOURCE_FILES main.c
         resolve.h
         root.h
         ../security.h
-        ../string.h)
+        ../string.h time_queue.h)
 
 link_libraries(libldns.so)
 

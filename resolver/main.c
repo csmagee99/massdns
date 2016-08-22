@@ -10,6 +10,8 @@
 #include <sys/epoll.h>
 #include <fcntl.h>
 
+#include <sys/resource.h>
+
 #include <ldns/packet.h>
 #include <ldns/rbtree.h>
 #include <ldns/keys.h>
@@ -37,7 +39,7 @@ typedef struct
 {
     int query_socket; //! Socket descripter providing the server interface
     buffer_t client_sockets; //! Socket descriptors providing
-    Hashmap *agenda; //! Contains records that are about to be resolved
+    agenda_t agenda; //! Contains records that are about to be resolved
     cache_t cache; //! Contains records that have been successfully resolved
     size_t tries; //! Number of tries to resolve before giving up
     size_t agenda_size;
@@ -52,12 +54,6 @@ typedef struct
 
 typedef struct
 {
-    agenda_key_t *key;
-    agenda_value_t *value;
-} agenda_removal_t;
-
-typedef struct
-{
     massdns_socket_t type;
     int descriptor;
 } socket_info_t;
@@ -67,6 +63,8 @@ void double_list_print(double_list_element_t *element, size_t index, void *param
     fprintf(stderr, "%s\n", (char *) element->data);
 }
 
+bool agenda_handle(agenda_key_t* key, agenda_value_t *value, void *p);
+
 void resolver_handle_query(context_t *context, socket_info_t *socket, sockaddr_storage_t addr, ldns_pkt *packet)
 {
     ldns_rr *question = ldns_rr_list_rr(ldns_pkt_question(packet), 0);
@@ -74,62 +72,72 @@ void resolver_handle_query(context_t *context, socket_info_t *socket, sockaddr_s
     char *owner = ldns_rdf2str(rdf);
     ldns_rr_type qtype = ldns_rr_get_type(question);
     uint16_t transaction_id = ldns_pkt_id(packet);
-#ifdef DEBUG
     char *typestr = ldns_rr_type2str(qtype);
     fprintf(stderr, "[Packet] Incoming request: %s %s\n", typestr, owner);
     safe_free(&typestr);
-#endif
     agenda_key_t *agenda_key = agenda_key_new(owner, qtype);
     agenda_value_t *agenda_value = agenda_get(context->agenda, agenda_key);
 
     if (agenda_value) // The request is already on our agenda, just add a recipient
     {
+        // TODO: Only add if recipient is new
         agenda_value_add_recipient(agenda_value, transaction_id, addr);
         safe_free(&owner);
-        safe_free(&agenda_key);
+        agenda_key_safe_free(&agenda_key);
         return;
     }
-
     agenda_value = safe_calloc(sizeof(*agenda_value));
-    agenda_value_add_recipient(agenda_value, transaction_id, addr);
-    agenda_value_update_time(agenda_value, 0);
     agenda_put(context->agenda, agenda_key, agenda_value);
+    agenda_value_add_recipient(agenda_value, transaction_id, addr);
+    agenda_value_update_time(context->agenda, agenda_value, 0);
     agenda_value_set_next_nameservers(context->agenda, context->cache, agenda_key, agenda_value, context->ip_support);
+
+    //agenda_handle(agenda_key, agenda_value, context);
+    safe_free(&owner);
+}
+
+bool handle_helper(void *v, void *param)
+{
+    //agenda_handle(((agenda_value_t*)v)->key, (agenda_value_t*)v, param);
+    return true;
 }
 
 void resolver_handle_response(context_t *context, socket_info_t *socket, sockaddr_storage_t addr, ldns_pkt *packet)
 {
+    fprintf(stderr, "RESPONSE\n");
     ldns_rr_list *questions = ldns_pkt_question(packet);
     if (ldns_rr_list_rr_count(questions) == 1) // We don't support queries with more or less than one question
     {
         ldns_rr *question = ldns_rr_list_rr(questions, 0);
         ldns_rdf *owner_rdf = ldns_rr_owner(question);
         char *owner = ldns_rdf2str(owner_rdf);
+
         ldns_rr_type type = ldns_rr_get_type(question);
-#ifdef DEBUG
         char *typestr = ldns_rr_type2str(ldns_rr_get_type(question));
         fprintf(stderr, "[Packet] Incoming response: %s %s\n", owner, typestr);
         safe_free(&typestr);
-#endif
+        cache_put_packet(context->cache, packet);
 
         // If we have received an update for an agenda value, directly continue resolving
         agenda_value_t *value = agenda_get_from_data(context->agenda, owner, type);
         if (value)
         {
-            agenda_value_update_time(value, 0);
+            agenda_value_update_time(context->agenda, value, 0);
             if(ldns_pkt_get_rcode(packet) != LDNS_RCODE_NOERROR)
             {
                 value->reply_packet = ldns_pkt_clone(packet);
             }
+            //agenda_handle(value->key, value, context);
         }
+        agenda_remove_packet(context->agenda, packet, handle_helper, context);
 
-        cache_put_packet(context->cache, packet);
-        agenda_remove_packet(context->agenda, packet);
+
+
         safe_free(&owner);
     }
 }
 
-void resolver_receive(context_t *context, socket_info_t *socket)
+bool resolver_receive(context_t *context, socket_info_t *socket)
 {
     uint8_t buf[0xFFFF];
     struct sockaddr_storage recvaddr;
@@ -144,22 +152,24 @@ void resolver_receive(context_t *context, socket_info_t *socket)
             {
                 resolver_handle_query(context, socket, recvaddr, packet);
             }
-            else if (ldns_pkt_qr(packet) && (socket->type & MASSDNS_SOCKET_CLIENT) != 0) // Reply to query received
+            else if (ldns_pkt_qr(packet)) // Reply to query received
             {
                 resolver_handle_response(context, socket, recvaddr, packet);
             }
             ldns_pkt_free(packet);
         }
+        return true;
     }
+    return false;
 }
 
-void agenda_reply(single_list_element_t *element, size_t i, void *param)
+bool agenda_reply(void *element, void *param)
 {
     tuple_t *tuple = param;
     context_t *context = tuple->component1;
     agenda_value_t *value = tuple->component2;
     ldns_pkt *packet = value->reply_packet;
-    recipient_t *recipient = element->data;
+    recipient_t *recipient = element;
 
     uint8_t *buffer;
     size_t buffer_size;
@@ -170,116 +180,132 @@ void agenda_reply(single_list_element_t *element, size_t i, void *param)
     }
 
     int fd = context->query_socket;
-    ssize_t sent = sendto(fd, buffer, buffer_size, 0, (sockaddr_t *) &recipient->address, sizeof(sockaddr_in_t));
+    ssize_t sent;
+    do
+    {
+        sent = sendto(fd, buffer, buffer_size, 0, (sockaddr_t *) &recipient->address, sizeof(sockaddr_in_t));
+    }
+    while(sent == 0);
     safe_free(&buffer);
+    return true;
 }
 
-agenda_removal_t *agenda_removal_new(agenda_key_t *key, agenda_value_t *value)
+bool agenda_handle(agenda_key_t* key, agenda_value_t *value, void *p)
 {
-    agenda_removal_t *agenda_removal = safe_malloc(sizeof(*agenda_removal));
-    agenda_removal->key = key;
-    agenda_removal->value = value;
-    return agenda_removal;
-}
-
-bool agenda_handle(void *k, void *v, void *p)
-{
-    agenda_key_t *key = k;
-    agenda_value_t *value = v;
     context_t *context = p;
     if (agenda_value_has_requirement(value)) // This agenda entry depends on another one
     {
         return true;
     }
-    if (agenda_value_is_due(value))
+    if (value->tries++ >= context->tries)
     {
-        if (value->tries++ >= context->tries)
+        fprintf(stderr, "[Agenda] Remove: %s\n", key->owner);
+        agenda_removal_list_add(context->agenda_removal, value);
+        return true;
+    }
+    agenda_value_update_time(context->agenda, value, context->retry_after_ms);
+
+    if (!value->reply_packet)
+    {
+        fprintf(stderr, "[Agenda] Resolve: %s\n", key->owner);
+        agenda_value_set_next_nameservers(context->agenda, context->cache, key, value, context->ip_support);
+
+        resolve_todo_t resolve_todo;
+        if(!agenda_todo(context->agenda, context->cache, key, value,
+                                                  context->agenda_addition, context->ip_support, &resolve_todo))
         {
-            fprintf(stderr, "[Agenda] Remove: %s\n", key->owner);
-            single_list_push_back(context->agenda_removal, agenda_removal_new(key, value));
             return true;
         }
-        agenda_value_update_time(value, context->retry_after_ms);
-
-        if (!value->reply_packet)
+        char buf[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &((struct sockaddr_in *)&resolve_todo.address)->sin_addr, buf, INET_ADDRSTRLEN);
+        fprintf(stderr, "IP: %s\n", buf);
+        ldns_pkt *packet = query_from_todo(&resolve_todo);
+        if (packet == NULL)
         {
-            fprintf(stderr, "[Agenda] Resolve: %s\n", key->owner);
-            agenda_value_set_next_nameservers(context->agenda, context->cache, key, value, context->ip_support);
-
-            resolve_todo_t resolve_todo = agenda_todo(context->agenda, context->cache, key, value,
-                                                      context->agenda_addition, context->ip_support);
-            ldns_pkt *packet = query_from_todo(&resolve_todo);
-            if (packet == NULL)
-            {
-                abort();
-            }
-
-            // TODO: Correctly select socket
-            uint8_t *buffer;
-            size_t buffer_size;
-            if (LDNS_STATUS_OK != ldns_pkt2wire(&buffer, packet, &buffer_size))
-            {
-                abort();
-            }
-            int fd = context->query_socket;
-            ssize_t sent = sendto(fd, buffer, buffer_size, 0, (sockaddr_t *) &resolve_todo.address,
-                                  sizeof(sockaddr_in_t));
-            if (sent < 0)
-            {
-                perror("Send error");
-            }
-            ldns_pkt_free(packet);
-            safe_free(&buffer);
+            abort();
         }
-        else
+
+
+        // TODO: Correctly select socket
+        uint8_t *buffer;
+        size_t buffer_size;
+        if (LDNS_STATUS_OK != ldns_pkt2wire(&buffer, packet, &buffer_size))
         {
-            fprintf(stderr, "[Agenda] Reply: %s\n", key->owner);
-            tuple_t tuple;
-            tuple.component1 = context;
-            tuple.component2 = value;
-            single_list_iterate(value->recipients, agenda_reply, &tuple);
-            ldns_pkt_free(value->reply_packet);
-            value->reply_packet = NULL;
-            fprintf(stderr, "[Agenda] Remove: %s\n", key->owner);
-            single_list_push_back(context->agenda_removal, agenda_removal_new(key, value));
-            return true;
+            abort();
         }
+        int fd = context->query_socket;
+        ssize_t sent;
+        do
+        {
+            sent = sendto(fd, buffer, buffer_size, 0, (sockaddr_t *) &resolve_todo.address, sizeof(sockaddr_in_t));
+        }
+        while(sent == 0);
+        ldns_pkt_free(packet);
+        safe_free(&buffer);
+    }
+    else
+    {
+        fprintf(stderr, "[Agenda] Reply: %s\n", key->owner);
+        tuple_t tuple;
+        tuple.component1 = context;
+        tuple.component2 = value;
+        single_list_iterate(value->recipients, agenda_reply, &tuple);
+        ldns_pkt_free(value->reply_packet);
+        value->reply_packet = NULL;
+        fprintf(stderr, "[Agenda] Remove: %s\n", key->owner);
+        agenda_removal_list_add(context->agenda_removal, value);
+        return true;
     }
     return true;
 }
 
+bool agenda_removal_handler(void *data, void *param)
+{
+    //fprintf(stderr, "P: %p\n", data);
+    agenda_remove(((context_t*)param)->agenda, ((agenda_value_t*)data)->key);
+    return true;
+}
+
+bool agenda_addition_handler(void *data, void *param)
+{
+    agenda_put(((context_t*)param)->agenda, ((agenda_value_t *)data)->key, (agenda_value_t *)data);
+    return true;
+}
 void resolver_send(context_t *context, socket_info_t *socket)
 {
-    agenda_iterate(context->agenda, &agenda_handle, context);
+    agenda_iterate_due(context->agenda, &agenda_handle, context);
+    //fprintf(stderr, "C: %zu\n", context->agenda_removal->count);
+    single_list_iterate_free(context->agenda_removal, &agenda_removal_handler, context);
+    single_list_iterate_free(context->agenda_addition, &agenda_addition_handler, context);
+}
 
-    for (single_list_element_t *elm = context->agenda_removal->first; elm != NULL;)
-    {
-        single_list_element_t *next_element = elm->next;
-        agenda_removal_t *data = elm->data;
-        agenda_remove(context->agenda, data->key);
-
-        agenda_key_safe_free(&data->key);
-        agenda_value_safe_free(&data->value);
-        safe_free(&data);
-        safe_free(&elm);
-        elm = next_element;
-    }
-    bzero(context->agenda_removal, sizeof(*context->agenda_removal));
-
-    for (single_list_element_t *elm = context->agenda_addition->first; elm != NULL;)
-    {
-        single_list_element_t *next_element = elm->next;
-        tuple_t *tuple = elm->data;
-        agenda_put(context->agenda, tuple->component1, tuple->component2);
-
-        safe_free(&elm);
-        elm = next_element;
-    }
-    bzero(context->agenda_addition, sizeof(*context->agenda_addition));
+bool process(void *data, void *ctx)
+{
+    fprintf(stderr, "Process: %s\n", (char*)data);
+    return true;
 }
 
 int main(int argc, char **argv)
 {
+    /*char *data = "abcdefg";
+    timeval_t res;
+    res.tv_sec = 0;
+    res.tv_usec = 1000;
+    time_queue_t *tqueue = time_queue_new(10000, res);
+    timeval_t time;
+    gettimeofday(&time, NULL);
+    time.tv_sec += 5;
+    time_queue_add(tqueue, &time, data);
+    while(true)
+    {
+        fprintf(stderr, "Process...\n");
+        time_queue_process_due(tqueue, process, NULL);
+        sleep(1);
+    }*/
+
+    struct rlimit core_limits;
+    core_limits.rlim_cur = core_limits.rlim_max = RLIM_INFINITY;
+    setrlimit(RLIMIT_CORE, &core_limits);
     context_t *context = malloc(sizeof(*context));
     memset(context, 0, sizeof(context));
     context->cache = cache_new(100000);
@@ -334,25 +360,35 @@ int main(int argc, char **argv)
 #pragma clang diagnostic ignored "-Wmissing-noreturn"
     while (true)
     {
-        int ready = epoll_wait(epollfd, pevents, 10000, 1);
+        size_t timeout = time_queue_next(context->agenda->queue);
+        int timeout_ms = -1;
+        if(timeout != SIZE_MAX)
+        {
+            timeout_ms = (int)timeout;
+        }
+        int ready = epoll_wait(epollfd, pevents, 10000, timeout_ms);
         if (ready < 0)
         {
+            fprintf(stderr, "to\n");
             // TODO: Add error handling
         }
         else if (ready == 0)
         {
             // Timeout
+            fprintf(stderr, "to\n");
+            resolver_send(context, query_socket_info);
             // TODO: Add error handling
         }
         else
         {
+
             for (int i = 0; i < ready; i++)
             {
                 if (pevents[i].events & EPOLLIN) // Data can be received
                 {
                     resolver_receive(context, pevents[i].data.ptr);
                 }
-                else if (pevents[i].events & EPOLLOUT) // Data can be sent
+                if (pevents[i].events & EPOLLOUT) // Data can be sent
                 {
                     resolver_send(context, pevents[i].data.ptr);
                 }
